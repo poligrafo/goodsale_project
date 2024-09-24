@@ -60,7 +60,9 @@ class Matcher:
             sku.similar_sku = similar_uuids
             logger.info("Updated SKU %s with similar SKUs: %s", sku.uuid, similar_uuids)
         except Exception as e:
-            logger.error("Ошибка при поиске похожих SKU для SKU %s: %s", sku.uuid, e)
+            logger.error(
+                "Error when searching for similar SKUs for SKU %s: %s", sku.uuid, e
+            )
 
     def process_all_skus(self, batch_size: int = 1000):
         total_skus = self.db_session.query(SKU).count()
