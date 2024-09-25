@@ -1,7 +1,8 @@
 import uuid as py_uuid
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import ARRAY, JSON, BigInteger, DateTime, Float, Integer, Text
+from sqlalchemy import (ARRAY, JSON, BigInteger, DateTime, Float, Index,
+                        Integer, Text)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -88,4 +89,10 @@ class SKU(Base):
     similar_sku: Mapped[Optional[List[py_uuid.UUID]]] = mapped_column(
         ARRAY(UUID(as_uuid=True)),
         comment="Похожие товары",
+    )
+
+    __table_args__ = (
+        Index("idx_sku_uuid", "uuid"),
+        Index("idx_sku_product_id", "product_id"),
+        Index("idx_sku_category_id", "category_id"),
     )

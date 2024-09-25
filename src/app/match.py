@@ -1,21 +1,28 @@
+import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import UUID
 
-from elasticsearch import Elasticsearch
-from sqlalchemy.orm import Session
+from elasticsearch import AsyncElasticsearch
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.models import SKU
 
 logger = logging.getLogger(__name__)
 
 
-class Matcher:
-    def __init__(self, es: Elasticsearch, db_session: Session, max_workers: int = 10):
+class AsyncMatcher:
+    def __init__(
+        self,
+        es: AsyncElasticsearch,
+        db_session: AsyncSession,
+        semaphore: asyncio.Semaphore,
+    ):
         self.es = es
         self.db_session = db_session
-        self.max_workers = max_workers
+        self.semaphore = semaphore
 
-    def create_index(self, index_name: str):
+    async def create_index(self, index_name: str):
         mappings = {
             "mappings": {
                 "properties": {
@@ -25,13 +32,14 @@ class Matcher:
                 }
             }
         }
-        if not self.es.indices.exists(index=index_name):
-            self.es.indices.create(index=index_name, body=mappings)
-            logger.info("Создан индекс '%s' в Elasticsearch", index_name)
+        exists = await self.es.indices.exists(index=index_name)
+        if not exists:
+            await self.es.indices.create(index=index_name, body=mappings)
+            logger.info("The index '%s' has been created in Elasticsearch", index_name)
 
-    def find_similar_skus(self, sku: SKU):
+    async def find_similar_skus(self, sku: SKU):
         if sku.uuid is None:
-            logger.error("SKU с product_id=%s имеет uuid=None", sku.product_id)
+            logger.error("SKU with product_id=%s has uuid=None", sku.product_id)
             return
 
         query = {
@@ -50,46 +58,51 @@ class Matcher:
             }
         }
 
-        try:
-            response = self.es.search(index="skus", body=query)
-            similar_uuids = [
-                hit["_id"]
-                for hit in response["hits"]["hits"]
-                if hit["_id"] != str(sku.uuid)
-            ][:5]
-            sku.similar_sku = similar_uuids
-            logger.info("Updated SKU %s with similar SKUs: %s", sku.uuid, similar_uuids)
-        except Exception as e:
-            logger.error("Ошибка при поиске похожих SKU для SKU %s: %s", sku.uuid, e)
+        async with self.semaphore:
+            try:
+                response = await self.es.search(index="skus", body=query)
+                similar_uuids = [
+                    UUID(hit["_id"])
+                    for hit in response["hits"]["hits"]
+                    if hit["_id"] != str(sku.uuid)
+                ][:5]
+                sku.similar_sku = similar_uuids
+                logger.info(
+                    "Updated SKU %s with similar SKUs: %s", sku.uuid, similar_uuids
+                )
+            except Exception as e:
+                logger.error(
+                    "Error when searching for similar SKUs for SKUs %s: %s",
+                    sku.uuid,
+                    e,
+                    exc_info=True,
+                )
 
-    def process_all_skus(self, batch_size: int = 1000):
-        total_skus = self.db_session.query(SKU).count()
+    async def process_all_skus(self, batch_size: int = 1000):
+        result = await self.db_session.execute(select(func.count(SKU.uuid)))
+        total_skus = result.scalar()
         logger.info("%d SKU found for processing", total_skus)
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_sku = {}
-            offset = 0
+        # Обрабатываем SKU пакетами
+        for offset in range(0, total_skus, batch_size):
+            result = await self.db_session.execute(
+                select(SKU).offset(offset).limit(batch_size)
+            )
+            skus = result.scalars().all()
+            logger.info("ОA package is being processed from %d SKU", len(skus))
 
-            while offset < total_skus:
-                skus = self.db_session.query(SKU).offset(offset).limit(batch_size).all()
-                if not skus:
-                    break
-                logger.info("A package from %d SKU is being processed", len(skus))
-                for sku in skus:
-                    future = executor.submit(self.find_similar_skus, sku)
-                    future_to_sku[future] = sku
-                offset += batch_size
+            tasks = [self.find_similar_skus(sku) for sku in skus]
+            await asyncio.gather(*tasks)
 
-            for future in as_completed(future_to_sku):
-                sku = future_to_sku[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    logger.error("SKU %s caused an exception: %s", sku.uuid, exc)
-
-        try:
-            self.db_session.commit()
-            logger.info("All similar SKUs have been successfully updated in the db.")
-        except Exception as e:
-            logger.error("Error when committing changes to the db: %s", e)
-            self.db_session.rollback()
+            try:
+                await self.db_session.commit()
+                logger.info(
+                    "The %d SKU batch has been successfully updated.", len(skus)
+                )
+            except Exception as e:
+                logger.error(
+                    "Error when committing changes to the database: %s",
+                    e,
+                    exc_info=True,
+                )
+                await self.db_session.rollback()

@@ -1,27 +1,27 @@
 import logging
 import uuid
 from io import BytesIO
-from typing import Any, Dict, Iterator
+from typing import Any, AsyncIterator, Dict
 
-import requests
+import aiohttp
 from lxml import etree
 
 from src.core.models import SKU
-from src.core.schemas import SKUCreate
 
 logger = logging.getLogger(__name__)
 
 
-class XMLParser:
+class AsyncXMLParser:
     def __init__(self, xml_url: str):
         self.xml_url = xml_url
         self.category_map: Dict[str, Any] = {}
 
-    def fetch_xml_stream(self):
+    async def fetch_xml_stream(self) -> bytes:
         logger.info("Loading an XML stream from %s", self.xml_url)
-        response = requests.get(self.xml_url, stream=True)
-        response.raise_for_status()
-        return response.content
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.xml_url) as response:
+                response.raise_for_status()
+                return await response.read()
 
     def parse_categories(self, root):
         logger.info("Category parsing")
@@ -50,35 +50,6 @@ class XMLParser:
             categories[cat_id]["full_path"] = build_category_path(cat_id)
 
         self.category_map = categories
-
-    def parse(self) -> Iterator[SKU]:
-        xml_content = self.fetch_xml_stream()
-        xml_file = BytesIO(xml_content)
-        context = etree.iterparse(
-            source=xml_file,
-            events=("end",),
-            tag=("offer", "categories"),
-            recover=True,
-        )
-
-        for event, elem in context:
-            if elem.tag == "categories":
-                self.parse_categories(elem)
-                elem.clear()
-                continue
-
-            if elem.tag == "offer":
-                try:
-                    sku = self.parse_offer(elem)
-                    yield sku
-                except Exception as e:
-                    logger.error("Error when parsing a sentence: %s", e)
-                finally:
-                    elem.clear()
-                    while elem.getprevious() is not None:
-                        del elem.getparent()[0]
-
-        xml_file.close()
 
     def parse_offer(self, elem) -> SKU:
         sku_data = {
@@ -129,8 +100,36 @@ class XMLParser:
 
         sku_uuid = uuid.uuid4()
 
-        sku_create = SKUCreate(**sku_data)
-        sku = SKU(**sku_create.dict())
+        sku = SKU(**sku_data)
         sku.uuid = sku_uuid
 
         return sku
+
+    async def parse(self) -> AsyncIterator[SKU]:
+        xml_content = await self.fetch_xml_stream()
+        xml_file = BytesIO(xml_content)
+        context = etree.iterparse(
+            source=xml_file,
+            events=("end",),
+            tag=("offer", "categories"),
+            recover=True,
+        )
+
+        for event, elem in context:
+            if elem.tag == "categories":
+                self.parse_categories(elem)
+                elem.clear()
+                continue
+
+            if elem.tag == "offer":
+                try:
+                    sku = self.parse_offer(elem)
+                    yield sku
+                except Exception as e:
+                    logger.error("Error when parsing a sentence: %s", e)
+                finally:
+                    elem.clear()
+                    while elem.getprevious() is not None:
+                        del elem.getparent()[0]
+
+        xml_file.close()
