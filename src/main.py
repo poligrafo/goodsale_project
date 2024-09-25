@@ -35,7 +35,7 @@ def main():
         # Creating an index and searching for similar SKU
         matcher = Matcher(
             es_client.es, db_session, max_workers=10
-        )  # Настройте количество потоков
+        )  # Adjust the number of threads
         matcher.create_index("skus")
         matcher.process_all_skus(batch_size=1000)
 
